@@ -1,208 +1,127 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
-from pydantic import BaseModel
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from bs4 import BeautifulSoup
-from typing import List
 import re
 
-app = FastAPI(title="Student Academic History API")
+app = FastAPI(title="Course Registration API")
 
-students = {}
-
-
-class HistoryRecord(BaseModel):
-    course_code: str
-    term: str
-    credits_earned: int
-    status: str
+courses = {}
 
 
-class HistoryUpdate(BaseModel):
-    history: List[HistoryRecord]
+def extract_course_codes(text):
+    if not text:
+        return []
+
+    pattern = r"\b[A-Z]{3,4}\s?\d{4}\b"
+    matches = re.findall(pattern, text)
+
+    cleaned = []
+    for match in matches:
+        cleaned.append(match.replace(" ", "").upper())
+
+    return list(dict.fromkeys(cleaned))
 
 
-class PlannedCourse(BaseModel):
-    course_code: str
-    term: str
+def parse_credits(text):
+    if not text:
+        return 0
 
-
-class PlanUpdate(BaseModel):
-    planned_courses: List[PlannedCourse]
-
-
-def grade_rank(grade: str):
-    grade = grade.strip()
-
-    if re.fullmatch(r"\d+(\.\d+)?", grade):
-        return 3
-
-    if grade and grade.upper() not in ["P", "PASS"]:
-        return 2
-
-    if grade.upper() in ["P", "PASS"]:
-        return 1
+    match = re.search(r"\d+(\.\d+)?", text)
+    if match:
+        return float(match.group())
 
     return 0
 
 
-def parse_credits(value: str):
-    try:
-        return int(float(value.strip()))
-    except:
-        return 0
-
-
-def parse_transcript_html(html_content: str):
+def parse_catalog_html(html_content):
     soup = BeautifulSoup(html_content, "html.parser")
-    records = {}
+    rows = soup.find_all("tr")
 
-    valid_statuses = {"Completed", "In-Progress", "Attempted"}
+    parsed_courses = {}
 
-    for table in soup.find_all("table"):
-        rows = table.find_all("tr")
+    for row in rows:
+        cells = row.find_all(["td", "th"])
 
-        for row in rows[1:]:
-            cells = row.find_all(["td", "th"])
-            values = [cell.get_text(" ", strip=True) for cell in cells]
+        if len(cells) < 3:
+            continue
 
-            if len(values) < 6:
-                continue
+        cell_texts = [cell.get_text(" ", strip=True) for cell in cells]
 
-            status_value = values[0]
-            course_code = values[1]
-            grade = values[3]
-            term = values[4]
-            credits = parse_credits(values[5])
+        course_code = None
+        for text in cell_texts:
+            codes = extract_course_codes(text)
+            if codes:
+                course_code = codes[0]
+                break
 
-            if status_value not in valid_statuses:
-                continue
+        if not course_code:
+            continue
 
-            if not term:
-                continue
+        title = ""
+        credits = 0
+        prerequisites = []
+        cross_listed = []
 
-            key = (course_code, term)
+        for text in cell_texts:
+            lower_text = text.lower()
 
-            new_record = {
-                "course_code": course_code,
-                "term": term,
-                "credits_earned": credits,
-                "status": status_value,
-                "_grade_rank": grade_rank(grade),
-            }
+            if "credit" in lower_text or re.fullmatch(r"\d+(\.\d+)?", text):
+                credits = parse_credits(text)
 
-            if key not in records:
-                records[key] = new_record
-            else:
-                old = records[key]
+            if "prereq" in lower_text or "requires" in lower_text:
+                prerequisites = extract_course_codes(text)
 
-                if new_record["_grade_rank"] > old["_grade_rank"]:
-                    records[key] = new_record
-                elif new_record["_grade_rank"] == old["_grade_rank"]:
-                    if new_record["credits_earned"] > old["credits_earned"]:
-                        records[key] = new_record
+            if "cross" in lower_text:
+                cross_listed = extract_course_codes(text)
 
-    cleaned = []
+        for text in cell_texts:
+            if course_code not in text and not re.search(r"\d+(\.\d+)?\s*credit", text.lower()):
+                if "prereq" not in text.lower() and "cross" not in text.lower():
+                    title = text
+                    break
 
-    for record in records.values():
-        record.pop("_grade_rank", None)
-        cleaned.append(record)
+        parsed_courses[course_code] = {
+            "course_code": course_code,
+            "title": title,
+            "credits": credits,
+            "prerequisites": prerequisites,
+            "cross_listed": cross_listed
+        }
 
-    return cleaned
-
-
-def require_student(student_id: str):
-    if student_id not in students:
-        raise HTTPException(status_code=404, detail="Student not found")
+    return parsed_courses
 
 
 @app.get("/")
 def root():
-    return {"message": "Student Academic History API is running"}
+    return {"message": "Course Registration API is running"}
 
 
-@app.post("/api/v1/students/{student_id}/history/import", status_code=status.HTTP_201_CREATED)
-async def import_history(student_id: str, file: UploadFile = File(...)):
+@app.post("/api/v1/admin/catalog/import")
+async def import_catalog(file: UploadFile = File(...)):
+    if not file.filename.endswith(".html"):
+        raise HTTPException(status_code=400, detail="Only HTML files are allowed")
+
     content = await file.read()
     html_content = content.decode("utf-8", errors="ignore")
 
-    history = parse_transcript_html(html_content)
+    parsed_courses = parse_catalog_html(html_content)
 
-    students[student_id] = {
-        "history": history,
-        "plan": []
-    }
+    if not parsed_courses:
+        raise HTTPException(status_code=400, detail="No courses found in uploaded catalog")
 
-    return {
-        "status": "success",
-        "past_courses_imported": len(history)
-    }
-
-
-@app.put("/api/v1/students/{student_id}/history")
-def update_history(student_id: str, body: HistoryUpdate):
-    require_student(student_id)
-
-    students[student_id]["history"] = [record.dict() for record in body.history]
+    courses.clear()
+    courses.update(parsed_courses)
 
     return {
-        "status": "success",
-        "message": "Academic history updated successfully"
+        "message": "Catalog imported successfully",
+        "courses_imported": len(courses)
     }
 
 
-@app.delete("/api/v1/students/{student_id}/history")
-def delete_history(student_id: str):
-    require_student(student_id)
+@app.get("/api/v1/catalog/courses/{course_code}")
+def get_course(course_code: str):
+    normalized_code = course_code.replace(" ", "").upper()
 
-    students[student_id]["history"] = []
+    if normalized_code not in courses:
+        raise HTTPException(status_code=404, detail="Course not found")
 
-    return {
-        "status": "success",
-        "message": "Academic history cleared successfully"
-    }
-
-
-@app.post("/api/v1/students/{student_id}/plan")
-def create_plan(student_id: str, body: PlanUpdate):
-    require_student(student_id)
-
-    students[student_id]["plan"] = [course.dict() for course in body.planned_courses]
-
-    return {
-        "status": "success",
-        "planned_courses_saved": len(body.planned_courses)
-    }
-
-
-@app.put("/api/v1/students/{student_id}/plan")
-def update_plan(student_id: str, body: PlanUpdate):
-    require_student(student_id)
-
-    students[student_id]["plan"] = [course.dict() for course in body.planned_courses]
-
-    return {
-        "status": "success",
-        "planned_courses_saved": len(body.planned_courses)
-    }
-
-
-@app.delete("/api/v1/students/{student_id}/plan")
-def delete_plan(student_id: str):
-    require_student(student_id)
-
-    students[student_id]["plan"] = []
-
-    return {
-        "status": "success",
-        "message": "Plan cleared successfully"
-    }
-
-
-@app.get("/api/v1/students/{student_id}/profile")
-def get_profile(student_id: str):
-    require_student(student_id)
-
-    return {
-        "student_id": student_id,
-        "history": students[student_id]["history"],
-        "plan": students[student_id]["plan"]
-    }
+    return courses[normalized_code]
