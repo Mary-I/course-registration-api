@@ -69,15 +69,9 @@ def extract_course_codes(text: str) -> List[str]:
     return result
 
 
-def parse_credits(value: str) -> int:
-    """Convert a credit value to an integer; invalid values become zero."""
+def parse_credits(value: str):
     try:
-        match = re.search(r"\d+(?:\.\d+)?", value)
-
-        if not match:
-            return 0
-
-        return int(float(match.group()))
+        return int(float(value.strip()))
     except (TypeError, ValueError):
         return 0
 
@@ -546,3 +540,4 @@ def root():
             "Course Registration and Academic Audit API is running"
         )
     }
+ß
