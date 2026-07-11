@@ -540,4 +540,3 @@ def root():
             "Course Registration and Academic Audit API is running"
         )
     }
-
