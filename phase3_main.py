@@ -1,51 +1,18 @@
-from collections import defaultdict, deque
-from threading import Lock
-from typing import Dict, List
+from typing import List
 
 import re
-import time
-
-import bcrypt
-import jwt
 from bs4 import BeautifulSoup
-from fastapi import (
-    Depends,
-    FastAPI,
-    File,
-    HTTPException,
-    Query,
-    Request,
-    UploadFile,
-    status,
-)
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel
 
 
 app = FastAPI(title="Course Registration and Academic Audit API")
 
 # Catalog records are keyed by normalized course code.
-catalog: Dict[str, dict] = {}
+catalog = {}
 
 # Student records are isolated by student_id.
-students: Dict[str, dict] = {}
-
-# Registered users are stored in memory.
-users: Dict[str, dict] = {}
-
-# JWT configuration.
-SECRET_KEY = "phase4-course-registration-secret-key"
-ALGORITHM = "HS256"
-TOKEN_LIFETIME_SECONDS = 3600
-
-# HTTPBearer with auto_error=False lets us return a consistent 401 response.
-security = HTTPBearer(auto_error=False)
-
-# Sliding-window rate-limit storage.
-RATE_LIMIT = 10
-RATE_WINDOW_SECONDS = 60
-audit_request_times = defaultdict(deque)
-rate_limit_lock = Lock()
+students = {}
 
 
 # -------------------------
@@ -72,11 +39,6 @@ class PlanUpdate(BaseModel):
     planned_courses: List[PlannedCourse]
 
 
-class UserCredentials(BaseModel):
-    username: str
-    password: str
-
-
 # -------------------------
 # Shared helper functions
 # -------------------------
@@ -84,17 +46,6 @@ class UserCredentials(BaseModel):
 def normalize_course_code(course_code: str) -> str:
     """Uppercase a course code and remove spaces and hyphens."""
     return re.sub(r"[\s-]+", "", course_code).upper()
-
-
-def display_course_code(course_code: str) -> str:
-    """Format a normalized code such as COSC2006 as COSC 2006."""
-    normalized = normalize_course_code(course_code)
-    match = re.fullmatch(r"([A-Z]{3,4})(\d{4})", normalized)
-
-    if not match:
-        return course_code
-
-    return f"{match.group(1)} {match.group(2)}"
 
 
 def extract_course_codes(text: str) -> List[str]:
@@ -118,10 +69,10 @@ def extract_course_codes(text: str) -> List[str]:
     return result
 
 
-def parse_credits(value: str) -> int:
+def parse_credits(value: str):
     try:
         return int(float(value.strip()))
-    except (AttributeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return 0
 
 
@@ -173,203 +124,6 @@ def term_sort_key(term: str):
 def require_student(student_id: str):
     if student_id not in students:
         raise HTTPException(status_code=404, detail="Student not found")
-
-
-def unauthorized():
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Unauthorized",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
-
-
-def create_access_token(username: str, role: str) -> str:
-    now = int(time.time())
-    payload = {
-        "sub": username,
-        "role": role,
-        "iat": now,
-        "exp": now + TOKEN_LIFETIME_SECONDS,
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
-
-def decode_token(token: str) -> dict:
-    try:
-        payload = jwt.decode(
-            token,
-            SECRET_KEY,
-            algorithms=[ALGORITHM],
-        )
-    except jwt.PyJWTError:
-        unauthorized()
-
-    username = payload.get("sub")
-    role = payload.get("role")
-
-    if not isinstance(username, str) or not username:
-        unauthorized()
-
-    if role not in {"student", "admin"}:
-        unauthorized()
-
-    return payload
-
-
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> dict:
-    if credentials is None or credentials.scheme.lower() != "bearer":
-        unauthorized()
-
-    return decode_token(credentials.credentials)
-
-
-def require_owner(
-    student_id: str,
-    current_user: dict,
-):
-    if current_user["sub"] != student_id:
-        unauthorized()
-
-
-def require_owner_or_admin(
-    student_id: str,
-    current_user: dict,
-):
-    is_owner = current_user["sub"] == student_id
-    is_admin = current_user.get("role") == "admin"
-
-    if not is_owner and not is_admin:
-        unauthorized()
-
-
-def rate_limit_key(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials,
-) -> str:
-    if credentials is not None:
-        if credentials.scheme.lower() != "bearer":
-            unauthorized()
-
-        payload = decode_token(credentials.credentials)
-        return f"user:{payload['sub']}"
-
-    client_host = request.client.host if request.client else "unknown"
-    return f"ip:{client_host}"
-
-
-def enforce_audit_rate_limit(key: str):
-    now = time.monotonic()
-    cutoff = now - RATE_WINDOW_SECONDS
-
-    with rate_limit_lock:
-        timestamps = audit_request_times[key]
-
-        while timestamps and timestamps[0] <= cutoff:
-            timestamps.popleft()
-
-        if len(timestamps) >= RATE_LIMIT:
-            raise HTTPException(
-                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                detail="Rate limit exceeded",
-            )
-
-        timestamps.append(now)
-
-
-def next_recommendation_term(level: int) -> str:
-    """
-    Produce ordered Fall/Winter terms beginning with 26F.
-
-    Level 0 -> 26F
-    Level 1 -> 27W
-    Level 2 -> 27F
-    Level 3 -> 28W
-    """
-    if level == 0:
-        return "26F"
-
-    year = 27 + ((level - 1) // 2)
-    season = "W" if level % 2 == 1 else "F"
-    return f"{year % 100:02d}{season}"
-
-
-# Seed the required hardcoded administrator.
-users["admin"] = {
-    "password_hash": bcrypt.hashpw(
-        b"admin",
-        bcrypt.gensalt(),
-    ),
-    "role": "admin",
-}
-
-
-# -------------------------
-# Phase 4: Authentication
-# -------------------------
-
-@app.post(
-    "/api/v1/auth/register",
-    status_code=status.HTTP_201_CREATED,
-)
-def register(credentials: UserCredentials):
-    username = credentials.username.strip()
-
-    if not username or not credentials.password:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Username and password are required",
-        )
-
-    if username in users:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Username already exists",
-        )
-
-    users[username] = {
-        "password_hash": bcrypt.hashpw(
-            credentials.password.encode("utf-8"),
-            bcrypt.gensalt(),
-        ),
-        "role": "student",
-    }
-
-    return {"status": "registered"}
-
-
-@app.post("/api/v1/auth/login")
-def login(credentials: UserCredentials):
-    username = credentials.username.strip()
-    account = users.get(username)
-
-    if account is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-        )
-
-    try:
-        password_matches = bcrypt.checkpw(
-            credentials.password.encode("utf-8"),
-            account["password_hash"],
-        )
-    except (TypeError, ValueError):
-        password_matches = False
-
-    if not password_matches:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid credentials",
-        )
-
-    token = create_access_token(username, account["role"])
-
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-    }
 
 
 # -------------------------
@@ -507,13 +261,7 @@ def parse_transcript_html(html_content: str):
     "/api/v1/students/{student_id}/history/import",
     status_code=status.HTTP_201_CREATED,
 )
-async def import_history(
-    student_id: str,
-    file: UploadFile = File(...),
-    current_user: dict = Depends(get_current_user),
-):
-    require_owner(student_id, current_user)
-
+async def import_history(student_id: str, file: UploadFile = File(...)):
     content = await file.read()
     html_content = content.decode("utf-8", errors="ignore")
     history = parse_transcript_html(html_content)
@@ -571,20 +319,6 @@ def create_plan(student_id: str, body: PlanUpdate):
     }
 
 
-@app.get("/api/v1/students/{student_id}/plan")
-def get_plan(
-    student_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    require_owner_or_admin(student_id, current_user)
-    require_student(student_id)
-
-    return {
-        "student_id": student_id,
-        "planned_courses": students[student_id]["plan"],
-    }
-
-
 @app.put("/api/v1/students/{student_id}/plan")
 def update_plan(student_id: str, body: PlanUpdate):
     require_student(student_id)
@@ -611,11 +345,7 @@ def delete_plan(student_id: str):
 
 
 @app.get("/api/v1/students/{student_id}/profile")
-def get_profile(
-    student_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    require_owner_or_admin(student_id, current_user)
+def get_profile(student_id: str):
     require_student(student_id)
 
     return {
@@ -661,7 +391,11 @@ def completed_course_records(history):
     return completed
 
 
-def build_audit_report(student_id: str, strict: bool):
+@app.get("/api/v1/students/{student_id}/audit-report")
+def get_audit_report(
+    student_id: str,
+    strict: bool = Query(default=False),
+):
     require_student(student_id)
 
     history = students[student_id]["history"]
@@ -796,150 +530,6 @@ def build_audit_report(student_id: str, strict: bool):
             "total_planned": total_planned,
             "total_remaining_for_graduation": total_remaining,
         },
-    }
-
-
-@app.get("/api/v1/students/{student_id}/audit-report")
-def get_audit_report(
-    request: Request,
-    student_id: str,
-    strict: bool = Query(default=False),
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-):
-    key = rate_limit_key(request, credentials)
-    enforce_audit_rate_limit(key)
-    return build_audit_report(student_id, strict)
-
-
-# -------------------------
-# Phase 4: Recommendations
-# -------------------------
-
-def create_recommended_pathway(student_id: str) -> List[dict]:
-    require_student(student_id)
-
-    history = students[student_id]["history"]
-    completed = completed_course_records(history)
-    completed_codes = set(completed)
-
-    # Only courses not already completed are recommendation candidates.
-    remaining_codes = {
-        course_code
-        for course_code in catalog
-        if course_code not in completed_codes
-    }
-
-    adjacency = {course_code: [] for course_code in remaining_codes}
-    indegree = {course_code: 0 for course_code in remaining_codes}
-    blocked_courses = set()
-
-    for course_code in remaining_codes:
-        prerequisites = catalog[course_code].get("prerequisites", [])
-
-        for prerequisite in prerequisites:
-            prerequisite_code = normalize_course_code(prerequisite)
-
-            if prerequisite_code in completed_codes:
-                continue
-
-            if prerequisite_code not in remaining_codes:
-                # The prerequisite is neither completed nor present in the
-                # catalog, so the course cannot safely be recommended.
-                blocked_courses.add(course_code)
-                continue
-
-            adjacency[prerequisite_code].append(course_code)
-            indegree[course_code] += 1
-
-    # Remove blocked courses and courses that depend on them.
-    changed = True
-
-    while changed:
-        changed = False
-
-        for course_code in list(remaining_codes):
-            if course_code in blocked_courses:
-                continue
-
-            prerequisites = catalog[course_code].get("prerequisites", [])
-
-            for prerequisite in prerequisites:
-                prerequisite_code = normalize_course_code(prerequisite)
-
-                if prerequisite_code in blocked_courses:
-                    blocked_courses.add(course_code)
-                    changed = True
-                    break
-
-    active_codes = remaining_codes - blocked_courses
-
-    active_indegree = {
-        course_code: 0
-        for course_code in active_codes
-    }
-    active_adjacency = {
-        course_code: []
-        for course_code in active_codes
-    }
-
-    for prerequisite_code in active_codes:
-        for dependent_code in adjacency[prerequisite_code]:
-            if dependent_code in active_codes:
-                active_adjacency[prerequisite_code].append(dependent_code)
-                active_indegree[dependent_code] += 1
-
-    # Kahn's algorithm, processed level by level.
-    ready = sorted(
-        course_code
-        for course_code, degree in active_indegree.items()
-        if degree == 0
-    )
-
-    pathway = []
-    processed = set()
-    level = 0
-
-    while ready:
-        current_level = ready
-        next_ready = []
-
-        pathway.append(
-            {
-                "term": next_recommendation_term(level),
-                "courses": [
-                    display_course_code(course_code)
-                    for course_code in current_level
-                ],
-            }
-        )
-
-        for course_code in current_level:
-            processed.add(course_code)
-
-            for dependent_code in active_adjacency[course_code]:
-                active_indegree[dependent_code] -= 1
-
-                if active_indegree[dependent_code] == 0:
-                    next_ready.append(dependent_code)
-
-        ready = sorted(set(next_ready))
-        level += 1
-
-    # Courses left unprocessed are part of a prerequisite cycle and are not
-    # added because no valid prerequisite-respecting pathway exists for them.
-    return pathway
-
-
-@app.get("/api/v1/students/{student_id}/recommendations")
-def get_recommendations(
-    student_id: str,
-    current_user: dict = Depends(get_current_user),
-):
-    require_owner_or_admin(student_id, current_user)
-
-    return {
-        "student_id": student_id,
-        "recommended_pathway": create_recommended_pathway(student_id),
     }
 
 
